@@ -1,0 +1,222 @@
+---
+title: "GaR data summary"
+author: "Colin White"
+date: "18/10/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)         
+library(lubridate)         
+library(readxl) 
+```
+
+
+```{r}
+rm(list = ls())
+```
+
+
+```{r}
+getwd()
+```
+
+```{r}
+randNorm <- rnorm(3000)
+randDensity <- dnorm(randNorm)
+
+p <- ggplot(data.frame(x = randNorm, y = randDensity)) + aes(x = x, y = y) + geom_line() + labs(title = "95% VaR - 95% confident loss will not exceed the 5th quantile of the loss distribution", x = "Random Normal Variable", y = "Density")
+p
+```
+
+
+```{r}
+quant5Seq <- seq(from = min(randNorm), to = -1.645, by = 0.1)
+lessThanQuant5 <- data.frame(x = quant5Seq, y = dnorm(quant5Seq))
+head(lessThanQuant5)
+```
+
+
+```{r}
+lessThanQuant5 <- rbind(c(min(randNorm), 0),
+                      lessThanQuant5, 
+                      c(max(lessThanQuant5$x), 0))
+p + geom_polygon(data = lessThanQuant5, aes(x = x, y = y))
+```
+
+
+
+
+
+
+
+```{r}
+GDP <- read_excel("StatsCan_table_36-10-0123.xlsx", 
+                  sheet = "Sheet1", 
+                  range = cell_cols("A:C"), 
+                  col_names = c("period", "level", "rate"))
+GDP <- GDP[-(1:8), ]
+
+
+head(GDP)
+```
+
+
+```{r}
+library(zoo)
+
+GDP_final <- GDP %>% 
+  mutate(Date = as.Date(as.yearqtr(period, format = "Q%q %Y")), 
+         Growth = as.numeric(rate)) %>% 
+  select(Date, Growth)
+
+head(GDP_final)
+```
+
+
+```{r}
+which(is.na(GDP_final$Growth))
+```
+
+```{r}
+summary(GDP_final$Growth)
+```
+
+
+
+```{r}
+ggplot(data = GDP_final) + geom_histogram(aes(x=Growth))
+```
+
+
+```{r}
+ggplot(data = GDP_final) + geom_boxplot(aes(x=Growth))
+```
+
+
+
+
+```{r}
+ggplot(GDP_final, aes(sample=Growth)) + 
+  stat_qq() +
+  stat_qq_line()
+```
+
+
+```{r}
+BIS_totcredit <- read_excel("BIS_totcredit.xlsx", 
+                        sheet = "Quarterly Series",
+                        col_types = c("date", rep("text", 1133))) %>%
+  select(Date = "Back to menu", starts_with("Canada")) %>%            
+  slice(-c(1:3)) %>% 
+  select(-contains("US Dollar"), -contains("Unadjusted"), -contains("Domestic currency")) %>%
+  mutate(Date = as.Date(Date))
+
+head(BIS_totcredit)
+```
+
+```{r}
+nn  <- gsub("Canada - ", "", names(BIS_totcredit))
+nn  <- gsub(" - Adjusted for breaks", "", nn)
+nn  <- gsub(" - Percentage of GDP", "", nn)
+nn  <- gsub(" at Market value", "", nn)
+
+BIS_totcredit <- rename_with(BIS_totcredit, ~ nn)
+
+print(nn)
+```
+
+```{r}
+dd <- BIS_totcredit %>%
+  pivot_longer(cols=-Date, names_to = "Var", values_to = "Val") %>%
+  mutate(Val = as.numeric(Val)) %>%
+  filter(!is.na(Val))
+
+ggplot(dd) + 
+  geom_line(aes(x = Date, y = Val, group = Var, colour = Var), show.legend = FALSE) +
+  facet_wrap(~Var, scales = "free") + 
+  theme_minimal() +
+  labs(x = "", y = "", title = "Canada's BIS credit data: levels, all as percentage of GDP")
+```
+
+```{r}
+lagv <- 4
+
+dd2 <- dd %>% 
+  group_by(Var) %>% 
+  mutate(Val = 100*(Val/lag(Val,lagv)-1)) %>% 
+  ungroup()
+
+ggplot(dd2) + 
+  geom_line(aes(x = Date, y = Val, group = Var, colour = Var), show.legend = FALSE) +
+  facet_wrap(~Var, scales = "free") + 
+  theme_minimal() +
+  labs(x = "", y = "", title = paste("Canada's BIS Credit data: Growth rates over", lagv, "quarters"))
+```
+
+```{r}
+dd2a <- filter(dd2, Var == nn[7]) %>% 
+  select(Date, Val) %>% 
+  rename_with(~ c("Date", "GCredit")) %>% 
+  mutate(Date = floor_date(Date, unit = "quarter")) %>% 
+  arrange(Date)
+
+ggplot(dd2a) + 
+  geom_line(aes(x = Date, y = GCredit), color = "red") +
+  theme_minimal() +
+  labs(x = "", y = "", title = paste("Credit to private non-financial sector from all sectors, percent growth rate over", lagv, "quarters"))
+```
+
+```{r}
+summary(dd2a$GCredit)
+```
+
+
+
+
+```{r}
+ggplot(data = dd2a) + geom_histogram(aes(x=GCredit))
+```
+
+```{r}
+ggplot(data = dd2a) + geom_boxplot(aes(x=GCredit))
+```
+
+```{r}
+ggplot(dd2a, aes(sample=GCredit)) + 
+  stat_qq() +
+  stat_qq_line()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
