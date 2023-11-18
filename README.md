@@ -15,5 +15,5 @@ The current stage of the project (Stage 3) includes the following documents
 4.	The datasets in excel 
 
 The results will be managed via the following GitHub repository:
-https://github.com/CJRitschl/TMU2/
+https://github.com/CJRitschl/TMU2
 
