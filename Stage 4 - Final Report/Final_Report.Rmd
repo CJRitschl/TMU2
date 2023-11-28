@@ -1,0 +1,602 @@
+---
+title: "Final Report Code - Colin"
+author: "Colin White"
+date: "27/11/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, include=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)         # Standard
+library(lubridate)         # Standard
+library(readxl)            # Standard
+library(zoo)               # Dates
+library(quantreg)          # Quantile regression
+library(ggridges)          # Ridgeline plots
+library(TSstudio)          # Time Series
+library(plotly)            # Visualization
+library(forecast)          # Regression used to forecast
+library(fpp3)              # Time series forecasting in R with tsibbles
+
+```
+
+
+```{r, include=FALSE}
+rm(list = ls())
+```
+
+
+```{r, include=FALSE}
+getwd()
+```
+
+## 1. Implementation of _GDP at Risk_ 
+
+This project replicates the _GDP-at-risk_ model, pioneered by Tobias Adrian et al at the International Monetary Fund. The idea is similar to Value-at-Risk (VaR), which calculates the maximum loss expected, typically the fifth quantile of the loss distribution, as opposed to the mean or "expected value." GaR uses quantile regression to estimates the conditional distribution of GDP growth (the response variable) as a function of some forward-looking financial indicator (the explanatory variable). The goal is to find the "at risk" value of GDP growth, defined as the fifth quantile of the conditional growth distribution. 
+
+
+## 2. Format, clean, sample, scale, decompose, or aggregate data
+
+Quarterly data for Canadian real GDP is downloaded into excel and read into R. To predict one and four periods ahead, the GDP data is lagged by one and four periods. 
+
+```{r}
+GDP <- read_excel("StatsCan_table_36-10-0123.xlsx", 
+                  sheet = "Sheet1", 
+                  range = cell_cols("A:C"), 
+                  col_names = c("period", "level", "rate"))
+GDP <- GDP[-(1:8), ]
+
+GDP_final <- GDP %>% 
+  mutate(Date = as.Date(as.yearqtr(period, format = "Q%q %Y")), 
+         Growth = as.numeric(rate)) %>% 
+  select(Date, Growth) %>% 
+  mutate(Growth_1 = lag(Growth, 1), 
+         Growth_4 = lag(Growth, 4)) %>%
+  select(Date, Growth, Growth_1, Growth_4) %>% 
+  drop_na()
+
+head(GDP_final)
+```
+
+In this project, we use the rate of credit growth as the independent variable to estimate the full conditional distribution of future real GDP growth: p(y = GDP growth | x = credit growth).
+
+The independent variable is taken from [BIS credit data](https://www.bis.org/statistics/totcredit.htm), available [here](https://www.bis.org/statistics/totcredit/totcredit.xlsx) -- the excel file "totcredit" is downloaded and read into R.  From the large totcredit file, comprising all BIS members (1133 columns), the Canadian credit data is excerpted (we use the credit series expressed as a percent of GDP).
+
+```{r, warning=FALSE}
+BIS_totcredit <- read_excel("BIS_totcredit.xlsx", 
+                        sheet = "Quarterly Series",
+                        col_types = c("date", rep("text", 1133))) %>%
+  select(Date = "Back to menu", starts_with("Canada")) %>%            
+  slice(-c(1:3)) %>% 
+  select(-contains("US Dollar"), -contains("Unadjusted"), -contains("Domestic currency")) %>%
+  mutate(Date = as.Date(Date))
+
+nn  <- gsub("Canada - ", "", names(BIS_totcredit))
+nn  <- gsub(" - Adjusted for breaks", "", nn)
+nn  <- gsub(" - Percentage of GDP", "", nn)
+nn  <- gsub(" at Market value", "", nn)
+
+BIS_totcredit <- rename_with(BIS_totcredit, ~ nn)
+
+dd <- BIS_totcredit %>%
+  pivot_longer(cols=-Date, names_to = "Var", values_to = "Val") %>%
+  mutate(Val = as.numeric(Val)) %>%
+  filter(!is.na(Val))
+
+ggplot(dd) + 
+  geom_line(aes(x = Date, y = Val, group = Var, colour = Var), show.legend = FALSE) +
+  facet_wrap(~Var, scales = "free") + 
+  theme_minimal() +
+  labs(x = "", y = "", title = "Canada's BIS credit data: levels, all as percentage of GDP")
+```
+
+As presented, the graphs shows the levels of Canada's credit growth, normalized to GDP.  However, we require the rates of credit growth. Below, the y/y rate of credit growth is calculated (equivalent to 4 quarterly lags) and plotted.
+
+```{r, warning=FALSE}
+lagv <- 4
+
+dd2 <- dd %>% 
+  group_by(Var) %>% 
+  mutate(Val = 100*(Val/lag(Val,lagv)-1)) %>% 
+  ungroup()
+
+ggplot(dd2) + 
+  geom_line(aes(x = Date, y = Val, group = Var, colour = Var), show.legend = FALSE) +
+  facet_wrap(~Var, scales = "free") + 
+  theme_minimal() +
+  labs(x = "", y = "", title = paste("Canada's BIS Credit data: Growth rates over", lagv, "quarters (= y/y growth rate)"))
+```
+
+From these seven credit series, we choose as our indicator variable: 
+
+- Credit to private non-financial sector from all sectors
+ 
+Advantages of choosing this series is that it provides a long history going back to the 1960s. Conceptually, it makes sense that credit to the private non-financial sectors is the driver of GDP growth. 
+
+The independent variable chosen looks as follows:
+
+```{r, warning=FALSE}
+dd2a <- filter(dd2, Var == nn[7]) %>% 
+  select(Date, Val) %>% 
+  rename_with(~ c("Date", "GCredit")) %>% 
+  mutate(Date = floor_date(Date, unit = "quarter")) %>% 
+  arrange(Date)
+
+ggplot(dd2a) + 
+  geom_line(aes(x = Date, y = GCredit), color = "red") +
+  theme_minimal() +
+  labs(x = "", y = "", title = paste("Credit to private sector from all sectors, percent growth rate over", lagv, "quarters"))
+```
+
+ The GDP and credit data are merged into one table. Like the GDP growth data, the credit growth data is lagged by one and four periods:
+
+```{r}
+dataz <- left_join(GDP_final, dd2a, by = "Date") %>% 
+  mutate(GCredit_1 = lag(GCredit,1)) %>% 
+  mutate(GCredit_4 = lag(GCredit,4)) %>% 
+  drop_na()
+
+dataz
+```
+
+The data is now prepared and ready to be modeled.  
+
+
+## Build and evaluate at least three models answering questions
+
+### First model: single linear regression
+
+We start with a single linear regression and regress GDP growth on time. To do so, add a variable "Trend" to the GDP data
+
+```{r}
+GDP_trend <- GDP %>% 
+  mutate(Date = as.Date(as.yearqtr(period, format = "Q%q %Y")), 
+         Growth = as.numeric(level)) %>% 
+  select(Date, Growth) %>% 
+  mutate(Trend = 1:nrow(GDP)) %>% 
+  select(Date, Growth, Trend) %>% 
+  drop_na()
+
+head(GDP_trend)
+```
+
+We visualize the GDP data (the dependent variable we are looking to predict)
+
+```{r}
+ggplot(GDP_trend) +
+  geom_line(aes(x = Date, y = Growth), color = "red") +
+  theme_minimal() +
+  labs(x = "", y = "", title = "Canada's GDP Growth -- Levels")
+```
+
+
+We will now regress GDP on the time index ("Trend") to generate a trend line.  We divide the data into train and test set, where the test data is only thye last 8 quarters
+
+```{r}
+h <- 8
+
+train <- GDP_trend[1:(nrow(GDP_trend) - h), ]
+test <- GDP_trend[(nrow(GDP_trend) - h + 1):nrow(GDP_trend), ]
+```
+
+We regress growth on trend using the train data set
+
+```{r}
+growth_trend <- lm(Growth ~ Trend, data = train)
+
+summary(growth_trend)
+```
+
+To visualize the trend line of the train data and the test data
+
+```{r}
+train$yhat <- predict(growth_trend, newdata = train)   #trendline of train data set
+
+test$yhat <- predict(growth_trend, newdata = test)   #trendline of test data set
+```
+
+We plot the result, showing the actual data ("Actual" = blue), the trend based on the train data ("Trend" = red) and the model's forecast for the last 8 quarters (dotted green)
+
+```{r}
+plot_lm <- function(data, train, test, title = NULL){
+  
+  p <- plot_ly(data = data, 
+               x = ~ Date,                                                 # date column from GDP_trend
+               y = ~ Growth,                                               # growth column from GDP_trend
+               type = "scatter", 
+               mode = "line",
+               name = "Actual") %>% 
+    add_lines(x = ~ train$Date,                                            #date column from training set                                       
+              y = ~ train$yhat,                                            #yhat column from training set
+              line = list(color = "red"),                                  #plotr a line that's red
+              name = "Trend") %>%                                          #Fitted values = training set
+    add_lines(x = ~ test$Date,
+              y = ~ test$yhat, 
+              line = list(color = "green", dash = "dot", width = 3),       #plot a dotted line that's green
+              name = "Forecasted") %>%                                     #forecasted values = test set  
+    layout(title = title, 
+           xaxis = list(title = "Year"), 
+           yaxis = list(title = "Canadian dolars"), 
+           legend = list(x = 0.05, y = 0.95))
+  return(p)                                                                #p = the image
+                 
+}   
+
+
+plot_lm(data = GDP_trend,                                                  #function call
+        train = train, 
+        test = test, 
+        title = "Predicting Trend Growth")
+```
+
+CONCLUSION: the linear model can project the trend but this is a very crude forecast that often overstimates or underestimates GDP growth.  Also, we note that linear OLS regressin produces a "point estimate" that represents the mean of the distriubution (or the "expected value").  
+
+Our goal, however, is to estimate the entire distribution of GDP grwoth per quarter. 
+
+We check the residuals for model performance:
+```{r}
+checkresiduals(growth_trend)
+```
+
+
+
+### Second model: multiple regression 
+
+Additional predictors that may be useful for forecasting GDP. Building a multiple linear regression model can potentially generate more accurate forecasts as we expect GDP to depend on credit growth.
+
+We are projecting one period ahead (using lagged independent variables for Growth and Credit).  in effect, we are regressing growth on two independent variables:  1) a lagged value of itself (as economic growth in the previous period contains used predictive value for the next period; and 2) the flow of credit to the economy in the previous period.
+
+Select other features: 
+```{r}
+GDP_credit <- dataz %>% 
+  select(Date, Growth, Growth_1, GCredit_1) %>% 
+  drop_na()
+
+head(GDP_credit)
+```
+
+We visualize the series that we are looking to predict (the dependent variable)
+
+```{r}
+ggplot(GDP_credit) + 
+  geom_line(aes(x = Date, y = Growth), color = "red") +
+  theme_minimal() +
+  labs(x = "", y = "Percent", title = paste("Percentage change of GDP growth"))
+```
+
+The FPP3 package ("Forecasting Principles and Practice") works with "tsibbles" instead of data frames.  We convert the data frame to a tsibble
+
+
+```{r}
+GDP_credit <- tsibble(GDP_credit)
+```
+
+We now formulate the multiple regression model as Growth ~ Growth1 + GCredit_1
+
+```{r}
+library(fpp3)
+
+fit_GC <- GDP_credit %>% 
+  model(tslm = TSLM(Growth ~ Growth_1 + GCredit_1))
+
+report(fit_GC)
+```
+same model
+```{r}
+fit_GDP_credit <- lm(Growth ~ Growth_1 + GCredit_1, data = GDP_credit)
+
+summary(fit_GDP_credit)
+```
+Residual analysis
+```{r}
+checkresiduals(fit_GDP_credit)
+```
+
+
+
+The augment function of the FPP3 library is useful because it includes predicted values in the .fitted column (as well as residuals in the .resid column, and standard errors for the fitted values in a .se.fit column).
+
+```{r}
+augment(fit_GC)
+```
+
+We can now visualize the result of the multiple regression by plotting the ".fitted" column (the predictions of the model) next to the growth column (the actual data)
+
+```{r}
+augment(fit_GC) %>%
+  ggplot(aes(x = Date)) +
+  geom_line(aes(y = Growth, colour = "Data")) +
+  geom_line(aes(y = .fitted, colour = "Fitted")) +                        #for ".fitted" see table below
+  labs(y = "Percent",
+    title = "Fitted vs Actual GDP Growth Rate"
+  ) +
+  scale_colour_manual(values=c(Data="black",Fitted="red")) +
+  guides(colour = guide_legend(title = NULL))
+```
+
+CONCLUSION:  We achieve a close fit of the fitted date with actual data using multiple regression and projecting one period ahead.  
+
+However, we note that the result is again a point estimate (the expected value per period).  This is not helful for our obkective of recovering the full conditional distribution of GDP grwoth per period.  
+
+
+
+
+### Third model: regression trees
+
+We explore regression trees but are skeptical whether decision trees are better suited for this task. Generally, decision trees are preferable if the independent variables include many features or many complex, nonlinear relationships among features and the outcome; in this case, we only have two independent variables.  
+
+Here we use the same data and ask if regression trees can improve on multiple OLS regression.  
+```{r}
+head(GDP_credit)
+```
+
+We split the data set into training and testing (with a 70/30 split)
+
+```{r}
+GC_train <- GDP_credit[1:178, ]
+GC_test <- GDP_credit[179:237, ]
+```
+
+We use the same logical for the model -- growth and credit in the previous quarter are the independent variables to predict the GDP growth in the current quarter
+
+```{r}
+library(rpart)
+
+m.rpart <- rpart(Growth ~ Growth_1 + GCredit_1, data = GC_train)
+
+m.rpart
+```
+
+The algorithm splits the decision tree by growth rate starting at the root node where grwoth is either laregr or smaller than 3.48%.  The tree has a depth of only 3 levels.  
+
+The decision tree is better understood through visualization:
+
+```{r, include = FALSE}
+summary(m.rpart)
+```
+
+We use the rpart.plot library to visualize
+
+```{r}
+library(rpart.plot)
+
+rpart.plot(m.rpart, digits = 3)
+```
+
+We use the trained model to predict the test data
+
+```{r}
+p.rpart <- predict(m.rpart, GC_test)
+
+summary(p.rpart)
+```
+
+A quick look at the summary statistics of our predictions suggests a potential problem: the predictions fall on a much narrower range than the true values:
+
+```{r}
+summary(GC_test$Growth)
+```
+
+The reason for this outcome can be easily seen when looking at the dependent variable.  The variablility actually increases over time.  The train data therefore does not capture the true variability in the test data. This is expained by the fact that, for numeric decision trees, homogeneity is measured by statistics such as variance, standard deviation, or absolute deviation from the mean (as opposed to classification trees, where homogeneity is measured by entropy).
+
+Here, we visualize the growing variability in the last 30% of the data.  
+```{r}
+ggplot(GDP_credit) + 
+  geom_line(aes(x = Date, y = Growth), color = "red") +
+  theme_minimal() +
+  labs(x = "", y = "Percent", title = paste("Percentage change of GDP growth"))
+```
+
+CONCLUSION: All three models considered do not help us with our goal of generating the whole conditional distribution of GDP growth. 
+
+
+### Fourth model: quantile regression to estimate the whole conditional distribution of GDP per period
+
+To estimate GDP growth distribution conditional on the flow of credit, we run a quantile regression and look at in-sample predictions. We run quantile regressions from the fifth quantile to the ninety-fifth quantile, in increments of 2.5 quantiles (for a total of 37 regression estimates per quarter). For clarity, we estimates independently 37 quantiles, covering the full conditional GDP growth distribution. 
+
+In contrast to ordinary least squares regression, quantile regression offers several advantages as follows: 
+
+- OLS regression estimates the conditional mean of the dependent variable (the "expected value") and, as such, is a point estimate. Quantile regression represents a more flexible approach for modeling the entire conditional distribution of GDP growth from tail to tail. This permits an analysis of possible downside risks, such as tail observations at the fifth qantile of the growth distribution.
+- While OLS regression makes parametric assumptions, such as requiring normal distribution of the error terms, quantile regression makes no parametric assumptions.  Each of the 37 qantiles in our regression is fitted independently.
+- While OLS brakes down given outliers and skew, quantile regression is robust to outliers and highly skewed distributions.  
+  
+The regression equation used here is:  eqn.q = Growth ~ Growth_1 + GCredit_1.  Note that we are projecting one period ahead (fcast = fcast_1)
+
+The quantile regression will start at the 5th quantile and proceed increments on 2.5 quantiles until the 95th quantile is reached.  The result will be 37 in-sample, empirical (non-parametric) probability density estimates. 
+
+```{r}
+fcast <- 1
+
+eqn.q <- formula(paste0("Growth ~ Growth_", fcast, " + GCredit_", fcast))
+
+q.inst <- rq(eqn.q, data = dataz, tau = seq(0.05, 0.95, 0.025))                   #rq is the quantile regression function from the quantreg package
+summary(q.inst)
+```
+
+
+```{r, warning=FALSE}
+anova(q.inst)
+```
+Model performance
+```{r, fig.width=6, fig.height=15}
+plot(summary(q.inst))
+```
+
+
+Having used quantile regression to obtain 37 in-sample, empirical (non-parametric) probability density estimates per quarter, we can now proceed to interpolate the dots along the 37 quantiles and plot them as ridgeline plots. In essence, we can think of this as simply smoothing the 37 empirical quantile estimates to obtain a non-parametric probability density curve.  
+
+To do so, we pull the predicted values into a matrix ("predict(q.inst)"), rename by date, and pivot longer for graphing in a ridgeline plot.  The results are shown in the following graph, which shows the conditional GDP growth distributions for each quarter back to the 1964.
+
+```{r nonpara, fig.width=8, fig.height=10, message=FALSE}
+q.predict <- t(predict(q.inst)) %>%           
+  as_tibble(.name_repair = "unique") %>% 
+  rename_with(~ as.character(dataz$Date)) %>%
+  pivot_longer(everything(), names_to = "Date", values_to = "Vals") %>%
+  mutate(Date = as.Date(Date)) %>% 
+  filter(lubridate::year(Date) > 1960)
+
+ggplot(q.predict, aes(x = Vals, y = Date, group = Date)) + 
+  geom_density_ridges(scale = 25, colour = "grey77", fill = "slateblue1", alpha = 0.3) +
+  theme_ridges() + 
+  labs(x = "", y = "", title = "GDP@Risk ~ Credit: Non-parametric densities, 1964-2023 Q2")
+```
+
+
+### Model 5: projecting one year ahead with quantile regression
+
+Growth at risk can only be modeled with quantile regression. There is no other statistical technique to obtain independent estimates for all the quantiles of the distribution. However, as modeled here, we can use the same code to project 4 quarters ahead. To illustrate, we copy the same code chunk below but set fcast <- 4
+
+```{r}
+fcast <- 4
+
+eqn.q2 <- formula(paste0("Growth ~ Growth_", fcast, " + GCredit_", fcast))
+
+q.inst2 <- rq(eqn.q2, data = dataz, tau = seq(0.05, 0.95, 0.025))                   #rq is the quantile regression function from the quantreg package
+summary(q.inst2)
+```
+
+```{r nonpara2, fig.width=8, fig.height=10, message=FALSE}
+q.predict2 <- t(predict(q.inst2)) %>%           
+  as_tibble(.name_repair = "unique") %>% 
+  rename_with(~ as.character(dataz$Date)) %>%
+  pivot_longer(everything(), names_to = "Date", values_to = "Vals") %>%
+  mutate(Date = as.Date(Date)) %>% 
+  filter(lubridate::year(Date) > 1960)
+
+ggplot(q.predict2, aes(x = Vals, y = Date, group = Date)) + 
+  geom_density_ridges(scale = 25, colour = "grey77", fill = "slateblue1", alpha = 0.3) +
+  theme_ridges() + 
+  labs(x = "", y = "", title = "GDP@Risk ~ Credit: Non-parametric densities, 1964-2023 Q2")
+```
+
+The results provide again a compelling proof of concept. As is generally the case in economics, quarterly data is considerably more volatile than annual data as the y/y calculation smooths out the the changes that occur in the four intervening quarters. Projecting four quarter ahead, the probability density curves appear more similar but there are compelling implications: 
+
+ - The conditional GDP growth distributions do not shift as much to the left and the right over time
+ - the recession signal comes in the form of a longer left tail 
+ - The year ahead projection indicates that there is more variation to the downside (more variation in the left tail than in the right tail). This is a fact that is emphasized in Tobias Adrian's paper -- it's more likely that shocks to the economy result in lost output and there are few "shocks" that make us better off. This is something that is better visible with the year ahead projection.
+ 
+At the same time, we note that the results are still broadly comparable. The flow of credit to the economy suggests that the 1980s recession is more severe than the 1970s. The 2009 recession had a greater potential impact than previous recessions and 2020 pandemic lockdown was potentially the worst.  
+
+It is important to recall the Tobias Adrian believes that this tool can function as a early warning signal and lead the government to intervene and "prevent" the worst case outcome. The pandemic did see decisive government intervention, explaining the powerful bounce back 
+
+
+## Provide a proof of concept ensuring the feasibility of the proposed solution
+
+Models 4 and 5 provide a compelling proof of concept. The flow of credit to the economy moves the whole growth distribution to the left and the right while also impacting the shape of the distribution (severe recessions as in 2009 and 2020 have longer left tails with considerable probability density to the left of the conditional mean or 50th percentile).
+
+The flow of credit to the economy predicted that the double dip recessions of the 1981 and 1982 would be deeper than the recessions of the 1970s. The model also predicts that the recession of 2009, triggered by the Global Financial Crisis, would be even more severe than the recessions of the early 1980s. Most compelling, the model predicted that the pandemic lockdowns in Q2, 2020, would lead to:
+
+ - a massive shift of the whole growth distribution to the left and solidly into negative growth territory across the whole distribution 
+ - much probability density in the left tail, which suggests that we would likely wind up with real GDP contraction exceeding 10% (the 5th quantile of the growth distribution is at around -12% GDP contraction)
+ 
+The model also predicted the large bounce back in Q3 2020, as government support allowed credit flows to recover powerfully and drive strong GDP growth. 
+ 
+The IMF argues that this model is useful because it allows the government to intervene decisively given the large amount of GDP-at-Risk in 2020. This allowed for a strong recovery.  
+
+We note the correspondence of the results obtained to the results of Tobias Adrian (shown in literature review).
+
+
+## Zoom in to better understand the COVID period
+
+The value of the model can be visualized by zooming in on the COVID period, where the model indeed predicts a massive decline in GDP growth based on Q2, 2020, credit flow to the economy. The tail observation in the 5th quantile of the growth distribution suggests a quarterly decline in GDP by over 10%, a fairly quick normalization and an eventual rebound. The massive growth decline expected provides a rationale for strong government measures to mitigate the contraction and to support grwoth with expansive fiscal and monetary policy to bring about a quick rebound.  
+
+```{r, nonpara3, fig.width=8, fig.height=6, message=FALSE}
+q.predict3 <- t(predict(q.inst)) %>%           
+  as_tibble(.name_repair = "unique") %>% 
+  rename_with(~ as.character(dataz$Date)) %>%
+  pivot_longer(everything(), names_to = "Date", values_to = "Vals") %>%
+  mutate(Date = as.Date(Date)) %>% 
+  filter(lubridate::year(Date) > 2019)
+
+ggplot(q.predict3, aes(x = Vals, y = Date, group = Date)) + 
+  geom_density_ridges(scale = 25, colour = "grey77", fill = "slateblue1", alpha = 0.3) +
+  theme_ridges() + 
+  labs(x = "", y = "", title = "GDP@Risk ~ Credit: Non-parametric densities during the COVID period")
+
+```
+
+
+## Fitting and skewed student t-distribution and visualizing the fifth quantile cutoff
+
+The final step conducted by Tobias Adrian is to fit a skewed student's t-distribution in order to recover a parametric distribution, described by: 
+
+ - a mean or central location: denoted here as xi
+ - the scale or dispersion: denoted here as omega
+ - the fatness of the tails: denoted here as alpha
+ - a shape parameter: denoted here as tau
+
+This will allow us to visualize the 5th quantile cut-off that is the "growth-at-risk". 
+
+The “sn” package in R fits a skewed t-distribution to the quantile estimates and, in the process, pins down the four parameters that describe a skewed t-distribution in a parametric way.
+
+Relative to the t-distribution, the skewed t-distribution adds a shape parameter, which regulates the skewing effect of the probability density function.
+
+In the following code, we estimate the four parameters for each quarter by minimizing the squared distance between our estimated, empirical quantile function and the parametric PDF of the skewed t-distribution.
+
+```{r, message=FALSE,warning=FALSE}
+library(sn)                # Skewed Student t-distribution
+library(fitdistrplus)      # Fit parametric distribution to non-parametric estimates
+
+dens <- NULL # Store densities
+val5 <- NULL # Store 5% info
+eall <- NULL # Store estimated parameters
+
+x   <- seq(-8,10,0.05)                        # Evaluate fitted density over this interval
+
+st  <- list(xi = 2, omega = 1, alpha = 0, tau = 0)
+for (i in unique(q.predict$Date)) {
+  
+  pp  <- filter(q.predict, Date==i)                             # Predicted vals for i
+  
+  fsn <- fitdist(pp$Vals, "sn", method="mge", start=st)         # Fit the skew t
+  e   <- fsn$estimate                                           # Fitted values
+  y   <- dsn(x,    xi=e[1], omega=e[2], alpha=e[3], tau=e[4])   # Fitted density
+  vr  <- qsn(0.05, xi=e[1], omega=e[2], alpha=e[3], tau=e[4])   # 5% quantile
+  dr  <- dsn(vr,   xi=e[1], omega=e[2], alpha=e[3], tau=e[4])   # Density at that point
+  
+  dens <- bind_rows(dens, tibble(x=x,   y=y,   Date=i))
+  val5 <- bind_rows(val5, tibble(vr=vr, dr=dr, Date=i))
+  eall <- bind_rows(eall, tibble(Date=as.Date(i), xi=e[1], omega=e[2], alpha=e[3], tau=e[4]))
+}
+```
+
+As part of the above parameter estimates, we calculated “vr” – the 5% quantile for each quarter. It is graphed below as the red dot along with the skewed t-distribution. The 5% quantile in the left tail is the “vulnerable growth” or “growth @ risk”
+
+```{r, fig.width=8, fig.height=10, message=FALSE}
+sc   <- 4150                                    # Scale factor
+ggplot(dens) + 
+  geom_ridgeline(aes(x = x, height = y, y = Date, group = Date), 
+                 colour = "grey77", fill = "slateblue1", scale = sc, alpha = 0.3) +
+  geom_point(data = val5, aes(x = vr, y = Date), color = "red", size=1.1) + 
+  theme_ridges() + 
+  labs(x = "", y = "", title = "GDP@Risk ~ Credit: Fitted skew-t and 5% quantile")
+```
+
+To better illustrate GaR, we can draw a vertical line between the x-axis at the 5% quantile up to the fitted t-distribution PDF. The area to the left of this vertical line under the PDF must accommodate 5% of the probability mass. A short line requires a longer left tail to accommodate 5% of the probability mass; a high vertical line leaves more space between the x-axis and the PDF, forcing the PDF down quickly towards the x-axis and resulting in a shorter tail.
+
+```{r, fig.width=8, fig.height=10, message=FALSE}
+dens <- mutate(dens, Datef=as.numeric(Date))    # Dates as numbers
+val5 <- mutate(val5, Datef=as.numeric(Date))
+
+ggplot(dens) + 
+  geom_ridgeline(aes(x=x, height=y, y=Datef, group=Date),
+                 colour="grey77", fill="slateblue1", scale=sc, alpha = 0.3) +
+  geom_segment(data=val5, aes(x=vr, xend=vr, y=Datef, yend=Datef+sc*dr), 
+               color="red", size=0.75) + 
+  theme_ridges() + 
+  labs(x="", y="", title = "GDP@Risk ~ Credit: Fitted skew-t and density at 5% quantile") +  
+  theme(axis.text.y = element_blank())
+```
+
+
+## Conclusion and next steps
+The implementation of GaR as presented here uses a single credit indicator as the explanatory variable to estimate the quantiles of the conditional GDP growth distribution p(y = GDP growth | x = credit growth). The major difference with the IMF’s implementation of Tobias Adrian’s model is that the latter is based on a wider financial conditions index. This difference has important implications, specifically:
+
+Amount of left-skew. Tobias Adrian’s conditional GDP distributions are much more left skewed when compared to the ones presented here.
+Stable right tails. Adrian emphasizes the stability of the right tails in his implementation and notes that downside risk in the left-tail varies much more strongly over time than upside risk. By contrast, the conditional growth distributions estimated here with credit growth are more symmetrical and show considerable upside risk, shaped presumably by the enormous credit expansions we continue to see. This more symmetric up and downside risk may provide valuable insights if we take a Minskian approach that emphasizes excessive credit creation over the cyclical upturn as the inevitable root of the following credit contraction.
+Shifts in the conditional GDP growth distribution. The quarterly, conditional GDP growth estimated by credit keep their symmetrical shape over time but show bigger shifts to both the left and the right over time (when compared to Adrian et al, where much of the movement over time occurs as the left tails wax and wane).
+
